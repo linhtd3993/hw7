@@ -1,0 +1,25 @@
+# Virtual environment
+lakehouse_env/
+
+# Credentials
+.env
+
+# Raw and generated data files (large files)
+local_landing_zone/
+lakehouse_storage/
+notebooks/unlock-profits-with-e-commerce-sales-data/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Spark / Ivy caches
+.ivy2/
+spark-warehouse/
+metastore_db/
+derby.log
