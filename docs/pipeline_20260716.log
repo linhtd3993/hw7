@@ -1,0 +1,10 @@
+2026-07-16 15:55:02 | config                    | INFO    | Testing config.py Configuration
+2026-07-16 15:55:02 | config                    | INFO    | USE_AZURE: True
+2026-07-16 15:55:02 | config                    | INFO    | Storage mode: Azure ADLS Gen2
+2026-07-16 15:55:02 | config                    | INFO    |   bronze → abfss://lakehouse@linhhw.dfs.core.windows.net/bronze
+2026-07-16 15:55:02 | config                    | INFO    |   silver → abfss://lakehouse@linhhw.dfs.core.windows.net/silver
+2026-07-16 15:55:02 | config                    | INFO    |   gold → abfss://lakehouse@linhhw.dfs.core.windows.net/gold
+2026-07-16 15:55:02 | config                    | INFO    |   landing_zone → /home/linhtd3993/workspace/projects/HW_7/local_landing_zone
+2026-07-16 15:55:02 | config                    | INFO    | Khởi tạo thử nghiệm Spark session...
+2026-07-16 15:55:05 | config                    | INFO    | SparkSession [ConfigTest] đã khởi tạo thành công (Spark 3.5.0)
+2026-07-16 15:55:05 | config                    | INFO    | Spark version: 3.5.0

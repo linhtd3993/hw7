@@ -1,81 +1,105 @@
-import os
+"""
+Pipeline làm sạch và chuẩn hóa dữ liệu cho tầng Silver.
+
+Đọc dữ liệu thô từ tầng Bronze Delta Table, thực thi Schema Enforcement
+(ép kiểu date, qty, amount, postal_code), khử trùng lặp theo khóa chính
+(order_id, sku), và ghi dữ liệu sạch sang tầng Silver dưới dạng Delta Lake
+phân vùng theo danh mục sản phẩm (category).
+"""
 from pyspark.sql.functions import col, to_date, coalesce, lit
 from pyspark.sql.types import IntegerType, DoubleType, StringType, LongType
-from config import get_spark_session, get_storage_paths
+from pyspark.sql.utils import AnalysisException
 
-def clean_to_silver():
-    print("=== BẮT ĐẦU PIPELINE LÀM SẠCH VÀ CHUẨN HÓA (TẦNG SILVER) ===")
-    
+from lakehouse_pipeline.config import (
+    get_spark_session,
+    get_storage_paths,
+    DATE_FORMAT_SPARK,
+    DEFAULT_CURRENCY,
+    DEFAULT_STATUS,
+    DEFAULT_COURIER_STATUS,
+    DEDUP_KEYS,
+    PARTITION_COL,
+)
+from lakehouse_pipeline.logger import get_logger
+
+logger = get_logger("silver_cleaning")
+
+
+def clean_to_silver() -> None:
+    """Đọc Bronze, làm sạch, ép schema, khử trùng và ghi sang Silver.
+
+    Quy trình xử lý:
+        1. Đọc Bronze Delta Table.
+        2. Ép kiểu: date → DateType, qty → IntegerType, amount → DoubleType.
+        3. Xử lý Null: điền giá trị mặc định cho currency, courier_status, status.
+        4. Chuẩn hóa ship_postal_code thành StringType sạch.
+        5. Khử trùng lặp theo cặp khóa (order_id, sku).
+        6. Ghi xuống Silver phân vùng theo category.
+
+    Raises:
+        AnalysisException: Nếu không đọc được Bronze Delta Table.
+    """
+    logger.info("=== BẮT ĐẦU PIPELINE LÀM SẠCH VÀ CHUẨN HÓA (TẦNG SILVER) ===")
+
     spark = get_spark_session("SilverCleaning")
     paths = get_storage_paths()
-    
+
     bronze_path = paths["bronze"]
     silver_path = paths["silver"]
-    
-    print(f"Đọc dữ liệu thô từ tầng Bronze: {bronze_path}")
-    print(f"Đường dẫn ghi tầng Silver: {silver_path}")
-    
+
+    logger.info("Bronze path : %s", bronze_path)
+    logger.info("Silver path : %s", silver_path)
+
     try:
         # 1. Đọc dữ liệu từ tầng Bronze Delta Table
         df_bronze = spark.read.format("delta").load(bronze_path)
-        print(f"Số lượng dòng thô tại Bronze: {df_bronze.count():,}")
-        
-        # 2. Xử lý làm sạch và ép kiểu dữ liệu nghiêm ngặt (Schema Enforcement)
+        row_count_bronze = df_bronze.count()
+        logger.info("Số lượng dòng thô tại Bronze: %s", f"{row_count_bronze:,}")
+
+        # 2. Schema Enforcement — ép kiểu và xử lý Null
         df_cleaned = (
             df_bronze
-            # Chuyển đổi định dạng ngày tháng 'MM-dd-yy' sang DateType
-            .withColumn("date_clean", to_date(col("date"), "MM-dd-yy"))
-            
-            # Ép kiểu số lượng đơn hàng sang IntegerType
+            .withColumn("date_clean", to_date(col("date"), DATE_FORMAT_SPARK))
             .withColumn("qty", col("qty").cast(IntegerType()))
-            
-            # Ép kiểu số tiền sang DoubleType và điền giá trị 0.0 nếu Null (thường gặp khi trạng thái là Cancelled)
             .withColumn("amount", coalesce(col("amount").cast(DoubleType()), lit(0.0)))
-            
-            # Xử lý cột postal code: Tránh để dạng float/double (ví dụ: 12345.0), chuyển thành long rồi cast thành string sạch
             .withColumn("ship_postal_code", col("ship_postal_code").cast(LongType()).cast(StringType()))
-            
-            # Điền giá trị mặc định cho các cột chuỗi bị Null
-            .withColumn("currency", coalesce(col("currency"), lit("INR")))
-            .withColumn("courier_status", coalesce(col("courier_status"), lit("Unknown")))
-            .withColumn("status", coalesce(col("status"), lit("Unknown")))
-            
-            # Loại bỏ các cột phụ hoặc cột lỗi (như unnamed__22 và cột date cũ)
+            .withColumn("currency", coalesce(col("currency"), lit(DEFAULT_CURRENCY)))
+            .withColumn("courier_status", coalesce(col("courier_status"), lit(DEFAULT_COURIER_STATUS)))
+            .withColumn("status", coalesce(col("status"), lit(DEFAULT_STATUS)))
             .drop("date", "unnamed__22")
-            # Đổi tên cột date_clean thành date để giữ tên chuẩn
             .withColumnRenamed("date_clean", "date")
         )
-        
-        # 3. Khử trùng lặp (Deduplication) dựa trên khóa chính tự nhiên: order_id và sku
-        # Trong e-commerce, một đơn hàng (order_id) có thể có nhiều mặt hàng khác nhau (sku) nhưng không thể trùng lặp sku trong cùng đơn hàng
-        print("Đang tiến hành khử trùng lặp dữ liệu...")
-        df_deduplicated = df_cleaned.dropDuplicates(["order_id", "sku"])
-        
-        # 4. Ghi dữ liệu xuống tầng Silver dưới định dạng Delta Lake
-        # Thiết kế phân vùng (Partitioning) theo cột 'category' (Danh mục sản phẩm)
-        # Sử dụng mode("overwrite") thay vì "append" để đảm bảo tính Idempotent (chạy lại script nhiều lần không bị nhân đôi dữ liệu)
-        print(f"Đang ghi dữ liệu sạch lên tầng Silver (phân vùng theo 'category')...")
+
+        # 3. Khử trùng lặp theo khóa chính tự nhiên
+        logger.info("Khử trùng lặp theo khóa: %s", DEDUP_KEYS)
+        df_deduplicated = df_cleaned.dropDuplicates(DEDUP_KEYS)
+
+        # 4. Ghi xuống Silver — phân vùng theo category, mode overwrite (idempotent)
+        logger.info("Ghi dữ liệu sạch lên Silver (phân vùng theo '%s')...", PARTITION_COL)
         (
             df_deduplicated.write
             .format("delta")
             .mode("overwrite")
-            .partitionBy("category")
+            .partitionBy(PARTITION_COL)
             .save(silver_path)
         )
-        
+
         # 5. Xác minh kết quả
         df_silver = spark.read.format("delta").load(silver_path)
-        print("\n=== HOÀN THÀNH PIPELINE TẦNG SILVER ===")
-        print(f"Tổng số dòng sau khi làm sạch & khử trùng: {df_silver.count():,}")
-        
-        # Hiển thị schema của tầng Silver
-        print("\nCấu trúc Schema tầng Silver:")
+        row_count_silver = df_silver.count()
+        rows_removed = row_count_bronze - row_count_silver
+
+        logger.info("=== HOÀN THÀNH PIPELINE TẦNG SILVER ===")
+        logger.info("Tổng dòng sau làm sạch & khử trùng: %s (loại bỏ %d dòng)", f"{row_count_silver:,}", rows_removed)
         df_silver.printSchema()
-        
-    except Exception as e:
-        print(f"Lỗi xảy ra ở tầng Silver: {e}")
+
+    except AnalysisException:
+        logger.exception("Lỗi phân tích Delta Table")
+    except Exception:
+        logger.exception("Lỗi không mong muốn ở tầng Silver")
     finally:
         spark.stop()
+
 
 if __name__ == "__main__":
     clean_to_silver()

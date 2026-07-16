@@ -1,64 +1,90 @@
+"""
+Bộ giả lập luồng dữ liệu Kaggle (Kaggle Stream Simulator).
+
+Đọc file CSV gốc ``Amazon Sale Report.csv``, phân rã theo từng ngày
+và ghi tuần tự các file CSV nhỏ vào thư mục ``local_landing_zone/``
+để mô phỏng luồng dữ liệu phát sinh hàng ngày cho Spark Structured Streaming.
+"""
 import os
-import time
 import shutil
+import time
+
 import pandas as pd
 
-# Định nghĩa đường dẫn
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_PATH = os.path.join(BASE_DIR, "notebooks", "unlock-profits-with-e-commerce-sales-data", "Amazon Sale Report.csv")
-LANDING_ZONE_DIR = os.path.join(BASE_DIR, "local_landing_zone")
+from lakehouse_pipeline.config import (
+    BASE_DIR,
+    LANDING_ZONE_PATH,
+    DATE_FORMAT_PANDAS,
+    SIMULATOR_DELAY_SECONDS,
+)
+from lakehouse_pipeline.logger import get_logger
 
-def main():
-    print("=== BẮT ĐẦU GIẢ LẬP LUỒNG DỮ LIỆU KAGGLE ===")
-    print(f"Đọc dữ liệu thô từ: {DATA_PATH}")
-    
+logger = get_logger("simulator")
+
+# Đường dẫn file dữ liệu gốc Kaggle
+DATA_PATH: str = os.path.join(
+    BASE_DIR, "notebooks", "unlock-profits-with-e-commerce-sales-data", "Amazon Sale Report.csv"
+)
+
+
+def _safe_filename(date_str: str) -> str:
+    """Chuyển chuỗi ngày thành tên file an toàn.
+
+    Args:
+        date_str: Chuỗi ngày gốc (ví dụ: ``"04-01-22"``).
+
+    Returns:
+        Tên file an toàn (ví dụ: ``"amazon_sales_04_01_22.csv"``).
+    """
+    safe = str(date_str).replace("-", "_").replace(" ", "_").replace("/", "_")
+    return f"amazon_sales_{safe}.csv"
+
+
+def main() -> None:
+    """Hàm chính: Đọc CSV gốc, chia nhỏ theo ngày, ghi tuần tự vào landing zone.
+
+    Raises:
+        FileNotFoundError: Nếu file dữ liệu gốc không tồn tại.
+    """
+    logger.info("=== BẮT ĐẦU GIẢ LẬP LUỒNG DỮ LIỆU KAGGLE ===")
+    logger.info("Đọc dữ liệu thô từ: %s", DATA_PATH)
+
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Không tìm thấy file dữ liệu gốc tại: {DATA_PATH}")
-        
+
     # Tạo sạch thư mục landing zone cục bộ
-    if os.path.exists(LANDING_ZONE_DIR):
-        print(f"Xóa và làm sạch thư mục landing zone cũ tại: {LANDING_ZONE_DIR}")
-        shutil.rmtree(LANDING_ZONE_DIR)
-    os.makedirs(LANDING_ZONE_DIR, exist_ok=True)
-    
+    if os.path.exists(LANDING_ZONE_PATH):
+        logger.info("Xóa và làm sạch landing zone cũ: %s", LANDING_ZONE_PATH)
+        shutil.rmtree(LANDING_ZONE_PATH)
+    os.makedirs(LANDING_ZONE_PATH, exist_ok=True)
+
     # Đọc dữ liệu gốc
     df = pd.read_csv(DATA_PATH, low_memory=False)
-    print(f"Đọc thành công file dữ liệu với {len(df):,} dòng.")
-    
-    # Parse cột Date để sắp xếp theo trình tự thời gian
-    df['parsed_date'] = pd.to_datetime(df['Date'], format='%m-%d-%y', errors='coerce')
-    
-    # Xử lý các dòng không parse được ngày (nếu có) bằng ngày mặc định
-    df['parsed_date'] = df['parsed_date'].fillna(pd.Timestamp('2022-01-01'))
-    
-    # Sắp xếp theo trình tự thời gian tăng dần
-    df = df.sort_values('parsed_date')
-    
-    # Lấy danh sách các ngày duy nhất để giả lập ghi
-    unique_dates = df['Date'].unique()
-    print(f"Tìm thấy {len(unique_dates)} ngày duy nhất để tiến hành giả lập luồng.")
-    
-    # Đếm số dòng mô phỏng thành công
-    for i, date_str in enumerate(unique_dates):
-        # Format tên file an toàn (thay thế ký tự đặc biệt nếu có)
-        safe_date_str = str(date_str).replace('-', '_').replace(' ', '_').replace('/', '_')
-        filename = f"amazon_sales_{safe_date_str}.csv"
-        target_path = os.path.join(LANDING_ZONE_DIR, filename)
-        
-        # Lấy dữ liệu thuộc ngày này (loại bỏ cột parsed_date hỗ trợ sort)
-        chunk_df = df[df['Date'] == date_str].drop(columns=['parsed_date'])
-        
-        print(f"[{i+1}/{len(unique_dates)}] Giả lập ngày {date_str}: Ghi {len(chunk_df):,} dòng vào {filename}...")
+    logger.info("Đọc thành công: %s dòng.", f"{len(df):,}")
+
+    # Parse và sắp xếp theo trình tự thời gian tăng dần
+    df["parsed_date"] = pd.to_datetime(df["Date"], format=DATE_FORMAT_PANDAS, errors="coerce")
+    df["parsed_date"] = df["parsed_date"].fillna(pd.Timestamp("2022-01-01"))
+    df = df.sort_values("parsed_date")
+
+    unique_dates = df["Date"].unique()
+    total = len(unique_dates)
+    logger.info("Tìm thấy %d ngày duy nhất để giả lập.", total)
+
+    # Ghi tuần tự từng file CSV theo ngày
+    for idx, date_str in enumerate(unique_dates, start=1):
+        filename = _safe_filename(date_str)
+        target_path = os.path.join(LANDING_ZONE_PATH, filename)
+
+        chunk_df = df[df["Date"] == date_str].drop(columns=["parsed_date"])
         chunk_df.to_csv(target_path, index=False)
-        
-        # Tạm dừng 2 giây giữa mỗi lần đẩy file để mô phỏng streaming
-        time.sleep(2)
-        
-        # Để tránh chạy vô hạn khi chạy thử nghiệm, chúng ta có thể giới hạn ghi thử 5 ngày trước
-        # Nếu muốn chạy toàn bộ, người dùng có thể cấu hình lại hoặc chạy trực tiếp.
-        # Ở đây ta sẽ cho chạy hết nhưng có thể ngắt bằng Ctrl+C.
-        
-    print("=== HOÀN THÀNH GIẢ LẬP LUỒNG DỮ LIỆU KAGGLE ===")
+
+        logger.info("[%d/%d] Ngày %s: ghi %s dòng → %s", idx, total, date_str, f"{len(chunk_df):,}", filename)
+
+        time.sleep(SIMULATOR_DELAY_SECONDS)
+
+    logger.info("=== HOÀN THÀNH GIẢ LẬP LUỒNG DỮ LIỆU KAGGLE ===")
+
 
 if __name__ == "__main__":
     main()

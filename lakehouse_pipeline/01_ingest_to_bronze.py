@@ -1,26 +1,54 @@
-import os
-from pyspark.sql.functions import current_timestamp, input_file_name
-from config import get_spark_session, get_storage_paths
+"""
+Pipeline nạp dữ liệu thô vào tầng Bronze.
 
-def ingest_to_bronze():
-    print("=== BẮT ĐẦU PIPELINE NẠP DỮ LIỆU TẦNG BRONZE ===")
-    
+Sử dụng Spark Structured Streaming để giám sát thư mục ``local_landing_zone/``,
+tự động nạp các file CSV mới phát sinh, thêm metadata kỹ thuật (ingest_timestamp,
+source_file), chuẩn hóa tên cột, và ghi xuống tầng Bronze dưới định dạng Delta Lake.
+"""
+import os
+
+from pyspark.sql.functions import current_timestamp, input_file_name
+
+from lakehouse_pipeline.config import (
+    get_spark_session,
+    get_storage_paths,
+    clean_dataframe_columns,
+    STREAMING_TIMEOUT_SECONDS,
+)
+from lakehouse_pipeline.logger import get_logger
+
+logger = get_logger("bronze_ingestion")
+
+
+def ingest_to_bronze() -> None:
+    """Nạp dữ liệu thô từ Landing Zone vào tầng Bronze trên Azure/Local.
+
+    Quy trình:
+        1. Khởi tạo Spark Structured Streaming để đọc CSV từ landing zone.
+        2. Chuẩn hóa toàn bộ tên cột sang snake_case (Delta Lake yêu cầu).
+        3. Thêm cột ``ingest_timestamp`` và ``source_file`` để truy vết.
+        4. Ghi stream xuống Bronze ở định dạng Delta với checkpoint.
+
+    Raises:
+        pyspark.sql.utils.StreamingQueryException: Nếu streaming query gặp lỗi.
+    """
+    logger.info("=== BẮT ĐẦU PIPELINE NẠP DỮ LIỆU TẦNG BRONZE ===")
+
     spark = get_spark_session("BronzeIngestion")
     paths = get_storage_paths()
-    
-    # Kích hoạt tính năng tự động suy luận Schema cho Structured Streaming
+
+    # Kích hoạt suy luận schema tự động cho Structured Streaming
     spark.conf.set("spark.sql.streaming.schemaInference", "true")
-    
+
     landing_zone = paths["landing_zone"]
     bronze_path = paths["bronze"]
     checkpoint_path = os.path.join(bronze_path, "_checkpoint")
-    
-    print(f"Giám sát Landing Zone tại: {landing_zone}")
-    print(f"Đường dẫn lưu trữ Bronze: {bronze_path}")
-    print(f"Đường dẫn checkpoint: {checkpoint_path}")
-    
-    # 1. Đọc dữ liệu dạng Stream từ local_landing_zone (CSV)
-    # Ở tầng Bronze, ta đọc thô hoàn toàn dưới dạng String (inferSchema=False) để bảo toàn dữ liệu gốc.
+
+    logger.info("Landing Zone : %s", landing_zone)
+    logger.info("Bronze path  : %s", bronze_path)
+    logger.info("Checkpoint   : %s", checkpoint_path)
+
+    # 1. Đọc CSV stream từ landing zone
     df_stream = (
         spark.readStream
         .format("csv")
@@ -28,22 +56,19 @@ def ingest_to_bronze():
         .option("inferSchema", "true")
         .load(landing_zone)
     )
-    
-    # Chuẩn hóa tên cột để tránh lỗi Delta Lake (không cho phép khoảng trắng/ký tự đặc biệt)
-    # Ví dụ: 'Order ID' -> 'order_id', 'Sales Channel ' -> 'sales_channel', 'ship-city' -> 'ship_city'
-    for col in df_stream.columns:
-        clean_col = col.strip().replace(" ", "_").replace("-", "_").replace(":", "_").replace("(", "_").replace(")", "_").lower()
-        df_stream = df_stream.withColumnRenamed(col, clean_col)
-    
-    # 2. Thêm các cột metadata kỹ thuật để truy vết nguồn gốc (data lineage)
+
+    # 2. Chuẩn hóa tên cột (dùng hàm tiện ích chung từ config)
+    df_stream = clean_dataframe_columns(df_stream)
+
+    # 3. Thêm metadata kỹ thuật cho data lineage
     df_bronze = (
         df_stream
         .withColumn("ingest_timestamp", current_timestamp())
         .withColumn("source_file", input_file_name())
     )
-    
-    # 3. Ghi dữ liệu stream trực tiếp xuống Bronze định dạng Delta Lake kèm checkpoint
-    print("Khởi chạy Structured Streaming Query...")
+
+    # 4. Ghi stream xuống Bronze ở định dạng Delta Lake
+    logger.info("Khởi chạy Structured Streaming Query...")
     query = (
         df_bronze.writeStream
         .format("delta")
@@ -51,20 +76,19 @@ def ingest_to_bronze():
         .option("checkpointLocation", checkpoint_path)
         .start(bronze_path)
     )
-    
-    print("Pipeline Structured Streaming đang chạy trong nền...")
-    print("Đang nạp dữ liệu từ local_landing_zone lên Bronze (chờ khoảng 30 giây để hoàn tất dữ liệu hiện tại)...")
-    
+
+    logger.info("Đang nạp dữ liệu (timeout=%ds)...", STREAMING_TIMEOUT_SECONDS)
+
     try:
-        # Cho stream chạy trong 30 giây để nạp hết 91 file CSV đang có
-        query.awaitTermination(timeout=30)
-        print("Đã hoàn tất nạp các lô dữ liệu hiện tại.")
-    except Exception as e:
-        print(f"Lỗi xảy ra trong quá trình streaming: {e}")
+        query.awaitTermination(timeout=STREAMING_TIMEOUT_SECONDS)
+        logger.info("Đã hoàn tất nạp các lô dữ liệu hiện tại.")
+    except Exception:
+        logger.exception("Lỗi xảy ra trong quá trình streaming")
     finally:
         query.stop()
         spark.stop()
-        print("=== PIPELINE BRONZE ĐÃ HOÀN THÀNH ===")
+        logger.info("=== PIPELINE BRONZE ĐÃ HOÀN THÀNH ===")
+
 
 if __name__ == "__main__":
     ingest_to_bronze()
